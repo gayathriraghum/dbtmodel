@@ -1,0 +1,144 @@
+from collections import defaultdict
+import boto3
+import datetime
+import rs_func
+from io import StringIO
+import os
+import pandas as pd
+
+#Added environment variables
+s3_out_cdh = os.environ["OUT_BUCKET"]
+wd = os.environ["IN_BUCKET"]
+wd_prefix = os.environ["OUT_BUCKET_PREFIX"]
+flow_path = wd
+flowPath_prefix =os.environ["IN_BUCKET_PREFIX"]
+
+def outputData(s3_cdh,wd_prefix, data, msid, qty):
+    file_name = f"{msid} - {qty}.csv"
+    load_date = datetime.datetime.today().strftime("%y%m%d")
+    s3_filename = f"{wd_prefix}/load_date={load_date}/{file_name}"
+    print(f"Outputting {s3_filename}")
+
+    tmp_file = '/tmp/' + file_name
+    with open(tmp_file, "w+") as f:
+        sort = sorted(data)
+        for day in sort:
+            reads = ",".join(str(x) for x in data[day])
+            (id, qty, day.strftime("%Y-%m-%d %H:%M:%S"), reads)
+            ln = ",".join((id, qty, day.strftime("%Y-%m-%d %H:%M:%S"), reads)) + "\n"
+            f.write(ln)
+
+    s3_client = boto3.resource('s3')
+    s3_client.Bucket(s3_cdh).upload_file(tmp_file, s3_filename)
+
+def archive_files(flow_path, flowPath_prefix):
+
+    s3 = boto3.resource('s3')
+    s3_client = boto3.client('s3')
+    rawdata_bucket = s3.Bucket(flow_path)
+    rawdata_prefix = flowPath_prefix
+    processed_prefix = flowPath_prefix + 'Processed/'
+    backup_prefix = flowPath_prefix + 'Backup/'
+    stg_prefix = flowPath_prefix + 'staging/'
+
+    ignore_processed = s3.Bucket(flow_path ).objects.filter(Prefix=processed_prefix)
+    ignore_bkp = s3.Bucket(flow_path ).objects.filter(Prefix=backup_prefix)
+    ignore_stg = s3.Bucket(flow_path ).objects.filter(Prefix=stg_prefix)
+    response = s3.Bucket(flow_path ).objects.filter(Prefix=rawdata_prefix)
+    
+    for obj in response:
+        if obj not in ignore_stg and obj not in ignore_processed and obj not in ignore_bkp and obj.size>0:
+            filename =obj.key
+            raw_source = { 'Bucket': flow_path, 'Key': obj.key} 
+            # replace the prefix
+            
+            processed_key = obj.key.replace(rawdata_prefix, processed_prefix, 1)
+            processed_obj = rawdata_bucket.Object(processed_key)
+            processed_obj.copy(raw_source)
+            print(filename + '- File Moved to ' + processed_key)
+                        
+            bkp_key = obj.key.replace(rawdata_prefix, backup_prefix, 1)
+            bkp_obj = rawdata_bucket.Object(bkp_key)
+            bkp_obj.copy(raw_source)
+            print(filename + '- File Moved to ' + bkp_key)
+            
+            print('Deleting file in rawdata folder ' + filename)
+            s3_client.delete_object(Bucket=flow_path, Key=filename)
+
+    return
+
+def staging_data():
+    s3 = boto3.resource('s3')
+    s3_client = boto3.client('s3')
+    
+    stg_bucket = s3.Bucket(flow_path)  
+    stg_prefix = flowPath_prefix +'staging/'
+    stg_data_df = pd.DataFrame(columns=['c1','c2'])
+    # Read CSV
+    for obj in stg_bucket.objects.filter(Prefix=stg_prefix):
+        fn = obj.key
+        print('Reading staging data from ' + fn)
+        read_file = s3_client.get_object(Bucket = flow_path, key = fn)
+        stg_df = pd.read_csv(read_file['Body'])
+        stg_data_df = stg_data_df.append([stg_df])
+    return stg_data_df
+
+
+def extractData(s3_out_cdh, wd_prefix,rs_ins_table):
+    
+    dataDict = genNestDict()
+    print("Extracting Data")
+    data_query = f'SELECT c1,c2 FROM {rs_ins_table} ORDER BY c1 ASC'
+    load_key_df = rs_func.get_flow_data(data_query)
+    print('Processed Records', len(load_key_df))
+    s3_data_df = staging_data()
+    print('Extracted Dataframe length from s3 staging bukcet', len(s3_data_df))
+    for index, row in load_key_df.iterrows():
+        day, hh = c2g.day_n_hh(row['c1'])
+        dataDict[row['c2']][row['c3']][row['c4']][row['c5']][day][hh] = [row['c6'], row['c7']]
+    print("Sorted Data")
+    print("Outputting Data")
+    op_count = 0
+    for meter in list(dataDict):
+        for qty in list(dataDict[meter]):
+            toOutput = deNest(dataDict[meter][qty])
+            outputData(s3_out_cdh,wd_prefix, toOutput, meter, qty)
+            op_count += 1
+            del dataDict[meter][qty]
+    print('total output files', op_count)
+
+
+def deNest(nest: dict):
+    # c1 --> c2 --> c3 --> c4
+    hh_list = lambda: [[0, "A"] for x in range(48)]
+    day_dict = defaultdict(hh_list)
+
+    for c1 in nest:
+        for register in nest[c1]:
+            for day in nest[c1][c2]:
+                oldList = day_dict[c3]
+                newList = nest[c1][c2][cday]
+                newNewList = [[x[0] + y[0], flagBool(x[1], y[1])] for x, y in zip(oldList, newList)]
+                day_dict[day] = newNewList
+
+    for day in day_dict:
+        oldList = day_dict[cday]
+        newList = [v[n] for n in range(0, 2) for v in oldList]
+        day_dict[day] = newList
+
+    return day_dict
+
+
+def flagBool(v1, v2):
+    return v1 if v1 == v2 else (v1 if v1 != "A" else v2)
+
+
+def genNestDict():
+    # c1 --> c2 --> c3 --> c4 --> cday --> cHH
+    chh = lambda: [[0, "A"] for x in range(48)]
+    cday = lambda: defaultdict(chh)
+    c5 = lambda: defaultdict(cday)
+    c4 = lambda: defaultdict(c3)
+    c2 = lambda: defaultdict(c3)
+    c1 = defaultdict(c2)
+    return c1
